@@ -540,6 +540,58 @@ async def _process_message(user_id: str, chat_id: str, is_group: bool, msg):
                 await feishu.send_text_to_user(user_id, f"❌ 下载图片失败：{e}")
             return
 
+    elif msg.message_type == "post":
+        # 富文本：图文混发（飞书把「文字 + 图片」一起发的消息归为 post）
+        try:
+            post = json.loads(msg.content)
+        except Exception:
+            return
+
+        # 解析正文：按段落拼接 text/a 元素，收集 img 元素的 image_key
+        image_keys: list[str] = []
+        para_texts: list[str] = []
+        for paragraph in post.get("content", []) or []:
+            line = ""
+            for el in (paragraph or []):
+                tag = el.get("tag")
+                if tag in ("text", "a"):
+                    line += el.get("text", "")
+                elif tag == "img":
+                    ik = el.get("image_key", "")
+                    if ik:
+                        image_keys.append(ik)
+            if line:
+                para_texts.append(line)
+        title = (post.get("title") or "").strip()
+        text = "\n".join(([title] if title else []) + para_texts).strip()
+
+        # 群聊去掉 @mention 占位符
+        if is_group:
+            mentions = getattr(msg, 'mentions', None) or []
+            for mention in mentions:
+                key = getattr(mention, 'key', '')
+                if key:
+                    text = text.replace(key, '').strip()
+
+        # 下载所有内嵌图片
+        img_paths: list[str] = []
+        for ik in image_keys:
+            try:
+                img_paths.append(await feishu.download_image(msg.message_id, ik))
+            except Exception as e:
+                print(f"[error] 下载富文本图片失败: {e}", flush=True)
+
+        if img_paths:
+            paths_str = "、".join(img_paths)
+            n = len(img_paths)
+            note = (f"\n\n[用户同时发送了 {n} 张图片，路径：{paths_str}，"
+                    f"请读取并结合上面的文字一起分析，直接回复用中文]")
+            text = (text + note).strip()
+
+        if not text:
+            return
+        print(f"[富文本] text={text[:50]} imgs={len(img_paths)}", flush=True)
+
     else:
         return  # 不支持的消息类型
 
