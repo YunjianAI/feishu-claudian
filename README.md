@@ -12,6 +12,15 @@ WebSocket 长连接，流式卡片输出，手机上随时 code review、debug�
   <img src="https://img.shields.io/badge/License-MIT-green" alt="MIT" />
 </p>
 
+> **关于这个 Fork**
+> 本仓库 fork 自 [joewongjc/feishu-claude-code](https://github.com/joewongjc/feishu-claude-code)（原作者 Jonathan，MIT 协议），在原项目基础上做了 **Windows 适配** 和 **手机端体验增强**：
+> - Windows 一键启动 / 一键重启脚本（`启动飞书bot.bat` / `重启飞书bot.bat`）
+> - 飞书机器人 **自定义悬浮菜单 + 子菜单**：单聊里常用功能（历史会话 / 新会话 / 切模型 / 状态 / 停止 / 全部命令）一键直达，体验接近桌面端
+> - `/restart` **一键重启** bot（菜单按钮 / 命令 / 卡片三种入口）
+> - Windows 下显式指向 `claude.exe`、UTF-8 控制台等踩坑修复
+>
+> 详见下方「Windows 适配与手机菜单」一节。原项目的全部能力保持不变。
+
 ## 特性
 
 **流式输出，实时可见**
@@ -137,6 +146,46 @@ python3 main.py
 
 `/commit`、`/review` 等未注册的斜杠命令直接转发给 Claude CLI 执行。你在 Claude Code 里能用的 Skill，飞书里也能用。
 
+## Windows 适配与手机菜单（本 Fork 新增）
+
+### 一键启动 / 一键重启
+
+仓库根目录提供两个批处理脚本（双击即可，无需手动激活 venv）：
+
+| 脚本 | 用途 |
+|------|------|
+| `启动飞书bot.bat` | 启动 bot，黑窗口保持打开 = bot 在线 |
+| `重启飞书bot.bat` | 等旧进程退出 5 秒后再拉起新实例，供 `/restart` 调用 |
+
+> 脚本内容为纯 ASCII（避免 Windows GBK 控制台中文乱码），文件名用中文方便识别。脚本里 `cd /d` 的路径需改成你本机仓库的实际路径。
+
+### 飞书自定义悬浮菜单 + 子菜单
+
+在飞书开放平台给机器人配置自定义菜单后，单聊会出现常驻悬浮按钮，常用功能一键直达：
+
+- 一级菜单：历史会话 / 新会话 / 切模型 / 更多
+- 子菜单「更多」：状态 / 停止任务 / 全部命令 / 重启bot / 用量 / skills
+
+**配置要点（两步缺一不可）**：
+
+1. 「机器人」→「自定义菜单」里给每个**叶子菜单项**配置「推送事件」并填一个 `event_key`（如 `resume` / `new` / `model` / `restart`）。父级容器只负责展开，不发事件
+2. 「事件与回调」→「事件配置」里**订阅 `application.bot.menu_v6` 事件**（长连接）。只配菜单项不订阅事件 = 点了没反应
+
+`event_key` 到命令的映射在 `main.py` 的 `MENU_KEY_COMMANDS` 字典里，改动后需重启 bot。
+
+### `/restart` 一键重启
+
+菜单按钮、直接输入 `/restart`、`/` 命令卡片三种入口都可触发。原理：派生一个延迟 5 秒的重启窗口 → `taskkill` 当前进程 → `os._exit(0)`，新窗口等旧进程死透再拉起，避免双实例重复回复。
+
+### Windows 关键环境变量
+
+| 变量 | 说明 |
+|------|------|
+| `CLAUDE_CLI_PATH` | **Windows 必填**，显式指向原生 `claude.exe`（如 `C:/Users/你/.local/bin/claude.exe`），否则 asyncio 无法执行 `claude.CMD` |
+| `NGROK_DOMAIN` | （可选）卡片按钮回调用的 ngrok 固定域名，配了之后重启公网地址不变，飞书后台只需填一次 |
+
+> 仅「卡片按钮」回调需要 ngrok 公网地址；悬浮菜单走长连接，**不需要** ngrok。
+
 ## 架构
 
 ```
@@ -216,12 +265,13 @@ python3 main.py
 |------|:---:|-------|------|
 | `FEISHU_APP_ID` | 是 | - | 飞书应用 App ID |
 | `FEISHU_APP_SECRET` | 是 | - | 飞书应用 App Secret |
-| `DEFAULT_MODEL` | 否 | `claude-opus-4-6` | 默认 Claude 模型 |
+| `DEFAULT_MODEL` | 否 | `claude-sonnet-4-6` | 默认 Claude 模型 |
 | `DEFAULT_CWD` | 否 | `~` | Claude CLI 默认工作目录 |
 | `PERMISSION_MODE` | 否 | `bypassPermissions` | 工具权限模式 |
 | `STREAM_CHUNK_SIZE` | 否 | `20` | 流式推送的字符积累阈值 |
-| `CLAUDE_CLI_PATH` | 否 | 自动查找 | Claude CLI 可执行文件路径 |
+| `CLAUDE_CLI_PATH` | 否 | 自动查找 | Claude CLI 可执行文件路径（Windows 建议显式指向 `claude.exe`） |
 | `CALLBACK_PORT` | 否 | `9981` | 卡片按钮回调 HTTP 端口 |
+| `NGROK_DOMAIN` | 否 | - | （可选）卡片回调用的 ngrok 固定域名 |
 
 ## 部署
 

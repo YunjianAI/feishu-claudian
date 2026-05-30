@@ -23,6 +23,9 @@ from lark_oapi.api.im.v1.model import P2ImMessageReceiveV1
 from lark_oapi.event.callback.model.p2_card_action_trigger import (
     P2CardActionTrigger, P2CardActionTriggerResponse, CallBackToast,
 )
+from lark_oapi.api.application.v6.model.p2_application_bot_menu_v6 import (
+    P2ApplicationBotMenuV6,
+)
 
 import bot_config as config
 from feishu_client import FeishuClient
@@ -112,6 +115,58 @@ async def _handle_stop_command(sender_open_id: str) -> str:
     return "已发送停止请求"
 
 
+async def _handle_restart_command(user_id: str) -> None:
+    """重启 bot：派生一个独立的延时重启窗口 → 关闭当前窗口 → 进程退出。
+
+    用于改完代码后一键重启（Python 启动时即把代码读进内存，必须重启才生效）。
+    重启脚本内置几秒延时，保证旧进程先退出，避免「同一时间两个 bot」导致重复回复。
+    """
+    import subprocess
+
+    try:
+        await feishu.send_card_to_user(
+            user_id,
+            content="🔁 正在重启 bot，约 10 秒后恢复。\n若 1 分钟内无响应，去电脑看一眼黑窗口。",
+            loading=False,
+        )
+    except Exception:
+        pass
+
+    bot_dir = os.path.dirname(os.path.abspath(__file__))
+    relauncher = os.path.join(bot_dir, "重启飞书bot.bat")
+
+    if not os.path.exists(relauncher):
+        print(f"[重启] 找不到重启脚本: {relauncher}", flush=True)
+        try:
+            await feishu.send_card_to_user(
+                user_id, content=f"❌ 重启失败：找不到 {relauncher}", loading=False
+            )
+        except Exception:
+            pass
+        return
+
+    # 1) 派生一个独立的新窗口跑重启脚本（脚本会先等几秒再起新进程）
+    try:
+        subprocess.Popen(f'start "" "{relauncher}"', shell=True, cwd=bot_dir)
+        print(f"[重启] 已派生重启脚本: {relauncher}", flush=True)
+    except Exception as e:
+        print(f"[重启] 派生重启脚本失败: {e}", flush=True)
+        return  # 派生失败就保持现状，不退出
+
+    # 2) 给 start 一点时间把新窗口脱离当前进程树，再关旧窗口
+    await asyncio.sleep(1.0)
+    try:
+        ppid = os.getppid()
+        subprocess.Popen(["taskkill", "/PID", str(ppid), "/T", "/F"])
+        print(f"[重启] 关闭当前窗口 ppid={ppid}", flush=True)
+    except Exception as e:
+        print(f"[重启] 关闭旧窗口失败（忽略）: {e}", flush=True)
+
+    # 3) 兜底：自我退出
+    await asyncio.sleep(0.5)
+    os._exit(0)
+
+
 # ── 命令菜单（锁外即时响应）──────────────────────────────────
 
 _COMMAND_MENU_GROUPS = [
@@ -133,6 +188,9 @@ _COMMAND_MENU_GROUPS = [
         {"text": "🔌 MCP",         "value": {"action": "run_cmd", "cmd": "/mcp"}},
         {"text": "📄 目录",        "value": {"action": "run_cmd", "cmd": "/ls"}},
         {"text": "❓ 帮助",        "value": {"action": "run_cmd", "cmd": "/help"}},
+    ]),
+    ("**系统**", [
+        {"text": "🔁 重启bot",     "value": {"action": "run_cmd", "cmd": "/restart"}},
     ]),
 ]
 
@@ -225,6 +283,11 @@ async def handle_message_async(event: P2ImMessageReceiveV1):
                 await feishu.reply_card(msg.message_id, content=reply, loading=False)
             else:
                 await feishu.send_card_to_user(user_id, content=reply, loading=False)
+            return
+
+        # /restart → 重启 bot（锁外即时处理，进程会自我退出并拉起新实例）
+        if _text.lower() == "/restart":
+            await _handle_restart_command(user_id)
             return
 
         # 单独输入 / → 显示命令菜单（按钮）
@@ -685,6 +748,11 @@ async def _handle_menu_command(user_id: str, chat_id: str, cmd_text: str, card_m
                 pass
         return
 
+    # /restart 特殊处理（进程自我退出并拉起新实例）
+    if cmd == "restart":
+        await _handle_restart_command(user_id)
+        return
+
     reply = await handle_command(cmd, args, user_id, chat_id, store)
     if reply is None:
         return
@@ -780,6 +848,68 @@ def on_message_receive(data: P2ImMessageReceiveV1) -> None:
     global _last_event
     _last_event = time.time()
     asyncio.run_coroutine_threadsafe(handle_message_async(data), _bot_loop)
+
+
+# ── 机器人自定义菜单 ─────────────────────────────────────────────
+# 飞书后台「机器人自定义菜单」配置的每个菜单项绑定一个 event_key（推送事件类型），
+# 点击后通过长连接下发 application.bot.menu_v6 事件。下表把 event_key 映射成命令。
+# 配置后台时，菜单项的 event_key 必须与下表的键一致。
+MENU_KEY_COMMANDS = {
+    # ── 高频（建议放悬浮菜单顶层）──
+    "resume": "/resume",      # 历史会话列表
+    "new": "/new",            # 新建会话
+    "model": "/model",        # 模型切换菜单
+    "menu": "/",              # 打开完整命令卡片（所有命令的抽屉）
+    "restart": "/restart",    # 重启 bot（改完代码一键重启）
+    # ── 低频（建议塞子菜单「更多」）──
+    "new_plan": "/new plan",  # 新建会话（规划模式）
+    "status": "/status",      # 当前状态
+    "stop": "/stop",          # 停止当前任务
+    "mode": "/mode",          # 切权限模式
+    "ws": "/ws",              # 工作空间
+    "usage": "/usage",        # 用量
+    "skills": "/skills",      # 技能列表
+    "mcp": "/mcp",            # MCP 列表
+    "ls": "/ls",              # 当前目录
+    "help": "/help",          # 帮助
+}
+
+
+async def _handle_menu_event(user_id: str, cmd_text: str):
+    """自定义菜单点击 → 发一张卡片承载结果（复用 _handle_menu_command 的执行+更新逻辑）"""
+    chat_id = user_id  # 自定义菜单只在单聊场景
+    if cmd_text == "/":
+        await _show_command_menu(user_id, chat_id, False, "")
+        return
+    # 先发一张 loading 占位卡片拿到 msg_id，再交给已有的菜单命令处理器更新它
+    try:
+        card_msg_id = await feishu.send_card_to_user(user_id, loading=True)
+    except Exception as e:
+        print(f"[菜单事件] 占位卡片发送失败: {e}", flush=True)
+        return
+    await _handle_menu_command(user_id, chat_id, cmd_text, card_msg_id)
+
+
+def on_bot_menu(data: P2ApplicationBotMenuV6) -> None:
+    """飞书 SDK 同步回调：机器人自定义菜单点击事件。"""
+    global _last_event
+    _last_event = time.time()
+    event_key = ""
+    user_id = ""
+    try:
+        event_key = data.event.event_key or ""
+    except Exception:
+        pass
+    try:
+        user_id = data.event.operator.operator_id.open_id or ""
+    except Exception:
+        pass
+    cmd_text = MENU_KEY_COMMANDS.get(event_key, "")
+    print(f"[菜单] user={user_id[:8] if user_id else '?'} key={event_key} "
+          f"→ {cmd_text or '(未映射)'}", flush=True)
+    if not user_id or not cmd_text:
+        return
+    asyncio.run_coroutine_threadsafe(_handle_menu_event(user_id, cmd_text), _bot_loop)
 
 
 # ── CLI Handover ─────────────────────────────────────────────
@@ -1018,6 +1148,7 @@ def main():
     handler = lark.EventDispatcherHandler.builder("", "") \
         .register_p2_im_message_receive_v1(on_message_receive) \
         .register_p2_card_action_trigger(on_card_action) \
+        .register_p2_application_bot_menu_v6(on_bot_menu) \
         .build()
 
     ws_client = lark.ws.Client(
