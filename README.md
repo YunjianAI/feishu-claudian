@@ -1,4 +1,4 @@
-# feishu-claude-code
+# feishu-claudian
 
 在飞书里直接和你本机的 Claude Code 对话。
 
