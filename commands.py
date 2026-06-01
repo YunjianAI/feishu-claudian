@@ -60,6 +60,9 @@ HELP_TEXT = """\
 `/mcp` — 列出已配置的 MCP Servers
 `/usage` — 查看 Claude Max 订阅用量百分比和重置时间
 
+**主动触发：**
+`/news` — 在当前对话里快速拉一份今日 AI 热点快讯（不写存档、不推群）
+
 
 **Claude Skills（直接转发给 Claude 执行）：**
 `/commit` — 提交代码

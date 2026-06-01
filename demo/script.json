@@ -1,0 +1,43 @@
+{
+  "node": "C:\\software\\nodejs\\node.exe",
+  "push_one_js": "D:\\sync-obsidian-feishu\\push-one.js",
+  "push_folder": "Claudian成稿",
+  "steps": [
+    {
+      "name": "调查梳理",
+      "chunk": 5,
+      "interval": 0.04,
+      "tools": [
+        { "line": "🔍 **搜索：** DeepSeek 5.29 限制重新生成 修改输入次数", "delay": 1.4 },
+        { "line": "🌐 **抓取网页...**", "delay": 1.1 },
+        { "line": "🔍 **搜索：** DeepSeek 反代理 网页端套API 薅羊毛", "delay": 1.3 },
+        { "line": "🌐 **抓取网页...**", "delay": 1.0 },
+        { "line": "🔎 **搜索内容：** 专家模式 上传 关闭 时间线", "delay": 1.0 }
+      ],
+      "file": "step1_调查.md"
+    },
+    {
+      "name": "长文+多视角评审",
+      "chunk": 5,
+      "interval": 0.035,
+      "tools": [
+        { "line": "🤖 **子任务：** 起草公众号长文（立场鲜明，单边）", "delay": 1.6 },
+        { "line": "🤖 **子任务：** 资深文案专家 评审中...", "delay": 1.2 },
+        { "line": "🤖 **子任务：** 目标读者画像 评审中...", "delay": 1.2 },
+        { "line": "🤖 **子任务：** 公众号运营专家 评审中...", "delay": 1.2 },
+        { "line": "🤖 **子任务：** 异见评审官 拷问论证...", "delay": 1.4 }
+      ],
+      "file": "step2_多视角.md"
+    },
+    {
+      "name": "上传飞书+发链接",
+      "chunk": 6,
+      "interval": 0.04,
+      "tools": [
+        { "line": "✏️ **写入：** DeepSeek限次长文.md（成稿）", "delay": 1.2 }
+      ],
+      "file": "step3_发链接.md",
+      "push": "DeepSeek限次长文.md"
+    }
+  ]
+}
