@@ -42,87 +42,70 @@ _DEMO_IDX: dict[str, int] = {}   # 每个 user 下一步要播的 step 序号（
 
 # ── 看门狗：定时重启防止 WebSocket 假死 ──────────────────────
 
-MAX_UPTIME = 0   # 0 = 禁用「定时自杀重启」，依赖飞书 SDK 自带的 ws 自动重连+心跳保活。
-                 # 历史上的 4*3600 硬重启在 Windows 上派生新进程极易失败（文件句柄被子进程
-                 # 继承占用 / 派生链静默断裂），反而是 bot 长时间掉线的主因（2026-06-01 03:39）。
+MAX_UPTIME = 4 * 3600   # 运行满 4 小时定时重启一次刷新 ws 长连接。重启已改用可靠的独立
+                        # 守护 _relaunch.py（taskkill 杀老整树 + 等 bot.log 释放 + 起新实例），
+                        # 不再是 2026-06-01 那种「自杀不复活」的脆弱重启，故恢复定时重启。
 _start_time = time.time()
 _last_event = time.time()
 
 
-def _spawn_relauncher() -> bool:
-    """直接派生一个完全独立的新 bot 进程并确认其存活；存活才返回 True（调用方可安全退出）。
+def _trigger_relaunch(reason: str = "") -> bool:
+    """触发一次可靠重启：用 `powershell Start-Process` 派生独立守护 `_relaunch.py`，把本
+    进程 pid 传给它。守护脱离本进程树（孤儿化）后，taskkill 杀掉本 bot 整个进程树（含
+    继承了 bot.log 句柄的「第二个 main.py」子进程和 claude 子进程）→ 轮询等 bot.log 释放
+    → 起新实例。完整逻辑见 _relaunch.py。
 
-    旧实现走「WMI → wscript → 静默重启.vbs →(sleep 5s)→ python」四跳，且不校验这条链
-    是否真把新 python 拉起来，只要那条 PowerShell 命令本身没报错就当成功 → 老进程 os._exit
-    自杀。任一跳静默失败（2026-06-01 03:39 即如此）就「自杀不复活」，bot 长时间掉线。
-
-    现改为：老进程用 DETACHED_PROCESS 直接启动 sys.executable main.py（同一套 .venv 解释器），
-    新进程脱离本进程树、不被本进程 os._exit 连带端掉；启动后确认它没有秒崩再返回 True。
-    新进程从启动到连上飞书 ws 约需 8s，而老进程确认存活(约 4s)后才退出，两者连飞书的时间窗
-    不重叠，因此不会「双开重复回复」。返回 False = 没拉起来，调用方绝不能退出（保持在线）。
+    返回 True = 守护已成功派生；调用方此后应**停止干活、就地等待被守护杀掉，绝不要
+    os._exit**：自行退出会让子进程变孤儿、逃过 taskkill /T，继续占着 bot.log 句柄，导致
+    新实例 `>> bot.log` 失败起不来——这正是 2026-06-01 多次掉线的根因。
+    返回 False = 派生失败，调用方应保持在线。
     """
     import subprocess
 
     bot_dir = os.path.dirname(os.path.abspath(__file__))
-    main_py = os.path.join(bot_dir, "main.py")
-    log_path = os.path.join(bot_dir, "bot.log")
-    DETACHED_PROCESS = 0x00000008
-    CREATE_NEW_PROCESS_GROUP = 0x00000200
+    relaunch_py = os.path.join(bot_dir, "_relaunch.py")
+    if not os.path.exists(relaunch_py):
+        print(f"[relaunch] 找不到重启守护脚本，放弃重启、保持在线: {relaunch_py}", flush=True)
+        return False
 
-    # 让子进程经 cmd 自己用 `>>` 追加写 bot.log（与首次启动 / vbs 同款的宽松共享模式）。
-    # 父进程绝不直接 open(bot.log)：当前进程的 stdout 已独占该文件，Python 再 open 会触发
-    # Windows 文件共享冲突 [Errno 13] Permission denied。cmd 的 `>>` 用 FILE_SHARE_WRITE，
-    # 可与现有写者并存，老进程退出后句柄自然释放。
-    # 关键时序（规避 Windows 两道墙：bot.log 文件独占 + 飞书 ws 双连重复回复）：
-    # cmd 先 ping 空转约 7s，期间老进程会 os._exit 退出，释放对 bot.log 的占用并断开飞书 ws；
-    # 之后 cmd 才起 python 追加写 bot.log（此时文件已空闲，不再 [Errno13]/「文件被占用」），
-    # 新 python 再连飞书（此时老连接已断，不会双开）。派生用 Popen+DETACHED 直连，
-    # 不经 WMI/wscript/vbs 三跳——那正是 2026-06-01 03:39「派生链静默断裂」的病根。
-    # 整条命令必须作为单一字符串传 Popen（用列表会被 list2cmdline 转义破坏）。
-    # 用 ping 当延时而非 timeout：timeout 在无控制台的 DETACHED 进程里会因无 stdin 失败。
-    cmdline = (
-        'cmd /c ping -n 8 127.0.0.1 >nul & '
-        'set "PYTHONUTF8=1" & set "PYTHONIOENCODING=utf-8" & '
-        f'"{sys.executable}" -u "{main_py}" >> "{log_path}" 2>&1'
+    my_pid = os.getpid()
+    # Start-Process 派生的守护，其父进程是随即退出的 powershell → 守护成孤儿、脱离本 bot
+    # 进程树，因此守护里 taskkill /T 本 bot 不会误杀自己（守护还会先 sleep 2s 等这个
+    # powershell 退出以确保脱离）。用阻塞 subprocess.run 确保 Start-Process 已发出。
+    ps = (
+        f"Start-Process -FilePath '{sys.executable}' "
+        f"-ArgumentList '-u','{relaunch_py}','{my_pid}' -WindowStyle Hidden"
     )
     try:
-        proc = subprocess.Popen(
-            cmdline,
-            cwd=bot_dir,
-            stdin=subprocess.DEVNULL,
-            close_fds=True,
-            creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP,
+        subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
+            cwd=bot_dir, timeout=20,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
+        print(f"[relaunch] 已派生独立重启守护 (old_pid={my_pid}, reason={reason})，等待被其杀掉重启", flush=True)
+        return True
     except Exception as e:
-        print(f"[watchdog] 派生新进程失败，放弃本次重启、保持在线: {e}", flush=True)
+        print(f"[relaunch] 派生重启守护失败，保持在线: {e}", flush=True)
         return False
-
-    # 确认重启器 cmd 已创建且没有秒崩（Popen 返回即已脱离本进程树，比 WMI 异步派生更可信）。
-    time.sleep(1.5)
-    if proc.poll() is not None:
-        print(f"[watchdog] 重启器cmd启动后立即退出(code={proc.returncode})，放弃本次重启、保持在线", flush=True)
-        return False
-
-    print(f"[watchdog] 已派生独立重启器 (cmd pid={proc.pid})，将在其 ~7s 等待窗口内退出本进程", flush=True)
-    return True
 
 
 def _watchdog():
-    """后台线程，定期检查进程健康。满 MAX_UPTIME 主动重启以刷新 WebSocket 长连接。"""
+    """后台线程，定期记录健康状态；满 MAX_UPTIME 触发一次可靠重启刷新 ws 长连接。"""
     global _start_time
     while True:
-        time.sleep(300)  # 每 5 分钟记录一次健康状态（uptime/idle），不再触发自杀重启
+        time.sleep(300)  # 每 5 分钟检查一次
         uptime = time.time() - _start_time
         idle = time.time() - _last_event
 
         if MAX_UPTIME and uptime > MAX_UPTIME:
-            print(f"[watchdog] 运行 {uptime/3600:.1f}h，定时重启刷新连接", flush=True)
-            # 关键修复：Windows 没有 launchctl 自动拉起，必须先派生替身再退出，
-            # 否则就是「定时自杀且不复活」。派生失败就不退出，重置计时下周期再试。
-            if _spawn_relauncher():
-                time.sleep(1.5)  # 给替身进程一点启动余量后再退出
-                os._exit(0)
-            print("[watchdog] 派生失败，放弃本次重启、保持在线，下周期重试", flush=True)
+            print(f"[watchdog] 运行 {uptime/3600:.1f}h，触发定时重启刷新连接", flush=True)
+            if _trigger_relaunch("watchdog 定时重启"):
+                # 守护会在几秒内 taskkill 本进程树并起新实例。这里**不 os._exit**（自行退出
+                # 会让子进程变孤儿逃过 taskkill、继续占 bot.log），就地等待被守护杀掉。
+                time.sleep(120)
+                _start_time = time.time()  # 万一 120s 内没被杀（极端），重置计时下周期再试
+                continue
+            print("[watchdog] 派生重启守护失败，保持在线，下周期重试", flush=True)
             _start_time = time.time()
             continue
 
@@ -190,70 +173,33 @@ async def _handle_stop_command(sender_open_id: str) -> str:
 
 
 async def _handle_restart_command(user_id: str) -> None:
-    """重启 bot：派生一个独立的延时重启窗口 → 关闭当前窗口 → 进程退出。
+    """重启 bot：派生独立重启守护 _relaunch.py → 守护杀本进程整树 + 等 bot.log 释放 + 起新实例。
 
-    用于改完代码后一键重启（Python 启动时即把代码读进内存，必须重启才生效）。
-    重启脚本内置几秒延时，保证旧进程先退出，避免「同一时间两个 bot」导致重复回复。
+    用于改完代码后一键重启（Python 启动时把代码读进内存，必须重启才生效）。
+    可靠性见 _trigger_relaunch / _relaunch.py：不再走旧的 WMI+vbs+sleep+os._exit 脆弱链
+    ——那套在子进程仍占着 bot.log 句柄时新实例起不来，是 2026-06-01 多次掉线的根因。
     """
-    import subprocess
-
     try:
         await feishu.send_card_to_user(
             user_id,
-            content="🔁 正在重启 bot，约 10 秒后恢复。\n若 1 分钟内无响应，去电脑双击「静默启动.vbs」。",
+            content="🔁 正在重启 bot，约 10-30 秒后恢复。\n若 1 分钟内无响应，去电脑双击「静默启动.vbs」。",
             loading=False,
         )
     except Exception:
         pass
 
-    bot_dir = os.path.dirname(os.path.abspath(__file__))
-    relauncher = os.path.join(bot_dir, "静默重启.vbs")
-
-    if not os.path.exists(relauncher):
-        print(f"[重启] 找不到重启脚本: {relauncher}", flush=True)
+    if _trigger_relaunch("手动 /restart"):
+        # 守护会 taskkill 本进程整树（含占着 bot.log 的「第二个 python」子进程）并起新实例。
+        # 这里**不 os._exit**：自行退出会让子进程变孤儿、逃过 taskkill、继续占 bot.log。
+        # 就地等待被守护杀掉（守护通常几秒内动手）。
+        await asyncio.sleep(120)
+    else:
         try:
             await feishu.send_card_to_user(
-                user_id, content=f"❌ 重启失败：找不到 {relauncher}", loading=False
+                user_id, content="❌ 重启失败：未能派生重启守护，bot 保持在线。", loading=False
             )
         except Exception:
             pass
-        return
-
-    # 1) 通过 WMI(Win32_Process.Create) 派生重启脚本。
-    #    关键修复：这样新进程的父进程是 WmiPrvSE.exe，脱离了下面 taskkill /T
-    #    要杀的进程树，不会被一起端掉。
-    #    旧实现用 subprocess.Popen 直接派生 wscript，它是本进程的子进程，
-    #    taskkill /T 会把它连根杀掉 → 5 秒延时还没走完就死了 → 永远拉不起新实例。
-    #    这里用阻塞 subprocess.run，确保独立重启进程已经存在后，再去关自己（消除竞态）。
-    ps_create = (
-        "Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments "
-        "@{CommandLine='wscript.exe //B \"" + relauncher + "\"';"
-        "CurrentDirectory='" + bot_dir + "'} | Out-Null"
-    )
-    try:
-        subprocess.run(
-            ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_create],
-            cwd=bot_dir,
-            timeout=20,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-        )
-        print(f"[重启] 已通过 WMI 派生独立重启进程（脱离进程树）: {relauncher}", flush=True)
-    except Exception as e:
-        print(f"[重启] 派生重启脚本失败: {e}", flush=True)
-        return  # 派生失败就保持现状，不退出
-
-    # 2) 重启进程已脱离本进程树，现在安全关闭当前窗口 + 旧 python
-    await asyncio.sleep(0.3)
-    try:
-        ppid = os.getppid()
-        subprocess.Popen(["taskkill", "/PID", str(ppid), "/T", "/F"])
-        print(f"[重启] 关闭当前窗口 ppid={ppid}", flush=True)
-    except Exception as e:
-        print(f"[重启] 关闭旧窗口失败（忽略）: {e}", flush=True)
-
-    # 3) 兜底：自我退出
-    await asyncio.sleep(0.5)
-    os._exit(0)
 
 
 # ── 命令菜单（锁外即时响应）──────────────────────────────────
